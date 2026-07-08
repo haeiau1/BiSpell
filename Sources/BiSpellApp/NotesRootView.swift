@@ -11,6 +11,9 @@ struct NotesRootView: View {
     @State private var pendingSelection: UUID?
     @State private var showDirtySwitchAlert = false
     @State private var showDirtyNewAlert = false
+    @State private var pendingNewAsTemplate = false
+    @State private var pendingTemplateID: UUID?
+    @State private var showDirtyFromTemplateAlert = false
 
     private var colors: NotesTheme.Colors {
         appearance.colors(colorScheme: colorScheme)
@@ -88,10 +91,19 @@ struct NotesRootView: View {
                 Menu {
                     Button("New Note") { attemptNewNote() }
                     Button("New Template") { attemptNewTemplate() }
+                    if !viewModel.templateNotes.isEmpty {
+                        Menu("New Note from Template") {
+                            ForEach(viewModel.templateNotes) { tmpl in
+                                Button(tmpl.displayTitle) {
+                                    attemptNewFromTemplate(tmpl.id)
+                                }
+                            }
+                        }
+                    }
                     if viewModel.draftIsTemplate {
                         Button("New Note from This Template") {
                             if let id = viewModel.selectedNoteID {
-                                viewModel.createNoteFromTemplate(id)
+                                attemptNewFromTemplate(id)
                             }
                         }
                         Button("Move to Notes") { viewModel.convertTemplateToNote() }
@@ -101,6 +113,14 @@ struct NotesRootView: View {
                 } label: {
                     Label("New", systemImage: "square.and.pencil")
                 }
+
+                Button {
+                    _ = viewModel.fixAllMisspellings()
+                } label: {
+                    Label("Fix All", systemImage: "text.badge.checkmark")
+                }
+                .help("Apply top suggestion to every unlocked misspelling (⌥⌘/)")
+                .disabled(viewModel.selectedNoteID == nil)
 
                 Button { viewModel.save() } label: {
                     Label("Save", systemImage: "square.and.arrow.down")
@@ -138,14 +158,47 @@ struct NotesRootView: View {
         .alert("Unsaved changes", isPresented: $showDirtyNewAlert) {
             Button("Save") {
                 viewModel.save()
-                viewModel.createNote(saveImmediately: true)
+                viewModel.createNote(saveImmediately: true, asTemplate: pendingNewAsTemplate)
+                pendingNewAsTemplate = false
             }
             Button("Discard", role: .destructive) {
-                viewModel.createNote(saveImmediately: true)
+                // Discard: reload draft from stored note then create.
+                if let id = viewModel.selectedNoteID {
+                    _ = viewModel.select(id: id, force: true)
+                }
+                viewModel.createNote(saveImmediately: true, asTemplate: pendingNewAsTemplate)
+                pendingNewAsTemplate = false
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) {
+                pendingNewAsTemplate = false
+            }
         } message: {
-            Text("Save the current note before creating a new one?")
+            Text(pendingNewAsTemplate
+                  ? "Save the current note before creating a new template?"
+                  : "Save the current note before creating a new one?")
+        }
+        .alert("Unsaved changes", isPresented: $showDirtyFromTemplateAlert) {
+            Button("Save") {
+                viewModel.save()
+                if let id = pendingTemplateID {
+                    _ = viewModel.createNoteFromTemplate(id, force: true)
+                }
+                pendingTemplateID = nil
+            }
+            Button("Discard", role: .destructive) {
+                if let id = viewModel.selectedNoteID {
+                    _ = viewModel.select(id: id, force: true)
+                }
+                if let tid = pendingTemplateID {
+                    _ = viewModel.createNoteFromTemplate(tid, force: true)
+                }
+                pendingTemplateID = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingTemplateID = nil
+            }
+        } message: {
+            Text("Save the current note before creating one from a template?")
         }
     }
 
@@ -218,7 +271,7 @@ struct NotesRootView: View {
         .contextMenu {
             if isTemplate {
                 Button("New Note from Template") {
-                    viewModel.createNoteFromTemplate(note.id)
+                    attemptNewFromTemplate(note.id)
                 }
                 Button("Move to Notes") {
                     if viewModel.select(id: note.id, force: true) {
@@ -280,8 +333,25 @@ struct NotesRootView: View {
                     canEdit: { range, rep in
                         viewModel.canEdit(range: range, replacement: rep)
                     },
-                    applyEdit: { range, rep in
-                        viewModel.applyEdit(range: range, replacement: rep)
+                    commitEditorChange: { newText, edited, replacement, preSpans in
+                        viewModel.commitEditorChange(
+                            newText: newText,
+                            edited: edited,
+                            replacement: replacement,
+                            previousSpans: preSpans
+                        )
+                    },
+                    smartDelete: { range in
+                        viewModel.smartDelete(range: range)
+                    },
+                    currentLockedSpans: {
+                        viewModel.draftLockedSpans
+                    },
+                    onBlockedEdit: {
+                        viewModel.notifyBlockedEdit()
+                    },
+                    restoreSnapshot: { text, spans, sel in
+                        viewModel.restoreSnapshot(text: text, spans: spans, selection: sel)
                     }
                 )
                 .padding(.horizontal, 4)
@@ -345,6 +415,7 @@ struct NotesRootView: View {
 
     private func attemptNewNote() {
         if viewModel.isDirty {
+            pendingNewAsTemplate = false
             showDirtyNewAlert = true
         } else {
             viewModel.createNote(saveImmediately: true, asTemplate: false)
@@ -353,8 +424,19 @@ struct NotesRootView: View {
 
     private func attemptNewTemplate() {
         if viewModel.isDirty {
-            viewModel.save()
+            pendingNewAsTemplate = true
+            showDirtyNewAlert = true
+        } else {
+            viewModel.createNote(saveImmediately: true, asTemplate: true)
         }
-        viewModel.createNote(saveImmediately: true, asTemplate: true)
+    }
+
+    private func attemptNewFromTemplate(_ id: UUID) {
+        if viewModel.isDirty {
+            pendingTemplateID = id
+            showDirtyFromTemplateAlert = true
+        } else {
+            _ = viewModel.createNoteFromTemplate(id, force: true)
+        }
     }
 }

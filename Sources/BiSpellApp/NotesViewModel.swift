@@ -106,9 +106,12 @@ final class NotesViewModel: ObservableObject {
     }
 
     /// New regular note cloned from a template (body + locked spans).
-    func createNoteFromTemplate(_ templateID: UUID) {
-        guard let template = notes.first(where: { $0.id == templateID && $0.isTemplate }) else { return }
-        flushPendingSave()
+    /// Returns false if current draft is dirty (caller should confirm first).
+    @discardableResult
+    func createNoteFromTemplate(_ templateID: UUID, force: Bool = false) -> Bool {
+        if isDirty, !force { return false }
+        guard let template = notes.first(where: { $0.id == templateID && $0.isTemplate }) else { return false }
+        if isDirty { persistDraftNow() }
         var note = Note(
             title: template.title == "Untitled template" ? "Untitled" : template.title,
             body: template.body,
@@ -124,8 +127,10 @@ final class NotesViewModel: ObservableObject {
             isDirty = false
             saveStatus = "From template"
             scheduleSpellCheck(autoPopup: false)
+            return true
         } catch {
             saveStatus = "Create failed"
+            return false
         }
     }
 
@@ -198,14 +203,18 @@ final class NotesViewModel: ObservableObject {
 
     /// Called by editor before applying an edit. Returns false if locked text would change.
     func canEdit(range: NSRange, replacement: String) -> Bool {
-        !LockedSpanMath.anyBlocks(draftLockedSpans, edit: range)
+        // Pure deletion of mixed content is handled by smartDelete, not canEdit.
+        if replacement.isEmpty, range.length > 0, LockedSpanMath.isMixedSelection(range, spans: draftLockedSpans) {
+            return true
+        }
+        return !LockedSpanMath.anyBlocks(draftLockedSpans, edit: range)
     }
 
-    /// Apply text replacement that was allowed by the editor; updates locks.
+    /// Apply text replacement that was allowed; updates locks (used by fix-all / programmatic edits).
     func applyEdit(range: NSRange, replacement: String) {
         let ns = draftBody as NSString
         guard range.location + range.length <= ns.length else { return }
-        guard canEdit(range: range, replacement: replacement) else { return }
+        guard !LockedSpanMath.anyBlocks(draftLockedSpans, edit: range) else { return }
         draftBody = ns.replacingCharacters(in: range, with: replacement)
         draftLockedSpans = LockedSpanMath.adjusting(
             draftLockedSpans,
@@ -217,6 +226,94 @@ final class NotesViewModel: ObservableObject {
         selectedRange = NSRange(location: caret, length: 0)
         markDirty()
         scheduleSpellCheck(autoPopup: false)
+    }
+
+    /// A1: NSTextView already applied the edit; commit body + span adjust from pre-edit spans.
+    func commitEditorChange(
+        newText: String,
+        edited: NSRange,
+        replacement: String,
+        previousSpans: [LockedSpan]
+    ) {
+        draftBody = newText
+        draftLockedSpans = LockedSpanMath.adjusting(
+            previousSpans,
+            edited: edited,
+            replacementLength: (replacement as NSString).length
+        )
+        draftLockedSpans = LockedSpanMath.clamp(draftLockedSpans, toTextLength: (newText as NSString).length)
+        selectedRange = NSRange(
+            location: edited.location + (replacement as NSString).length,
+            length: 0
+        )
+        markDirty()
+        scheduleSpellCheck(autoPopup: false)
+    }
+
+    func notifyBlockedEdit() {
+        saveStatus = "Can't edit locked text — unlock first"
+    }
+
+    /// B3: delete only unlocked segments inside `range` (back-to-front).
+    func smartDelete(range: NSRange) {
+        let segments = LockedSpanMath.unlockedSegments(of: range, spans: draftLockedSpans)
+        guard !segments.isEmpty else {
+            notifyBlockedEdit()
+            return
+        }
+        var body = draftBody
+        var spans = draftLockedSpans
+        for seg in segments.sorted(by: { $0.location > $1.location }) {
+            let ns = body as NSString
+            guard seg.location + seg.length <= ns.length else { continue }
+            body = ns.replacingCharacters(in: seg, with: "")
+            spans = LockedSpanMath.adjusting(spans, edited: seg, replacementLength: 0)
+        }
+        draftBody = body
+        draftLockedSpans = LockedSpanMath.clamp(spans, toTextLength: (body as NSString).length)
+        // Caret at start of original selection (still valid after back-to-front deletes inside range).
+        let caret = min(range.location, (body as NSString).length)
+        selectedRange = NSRange(location: caret, length: 0)
+        markDirty()
+        scheduleSpellCheck(autoPopup: false)
+        saveStatus = "Deleted unlocked text"
+    }
+
+    func restoreSnapshot(text: String, spans: [LockedSpan], selection: NSRange) {
+        draftBody = text
+        draftLockedSpans = spans
+        selectedRange = selection
+        markDirty()
+        scheduleSpellCheck(autoPopup: false)
+    }
+
+    func editorSnapshot() -> (text: String, spans: [LockedSpan], selection: NSRange) {
+        (draftBody, draftLockedSpans, selectedRange)
+    }
+
+    /// B1: apply top suggestion to every current (unlocked) misspelling. Returns summary.
+    @discardableResult
+    func fixAllMisspellings() -> String {
+        runSpellCheck(autoPopup: false)
+        let plan = TextReplacementBatch.plan(misspellings: misspellings) { m in
+            fillSuggestions(m).suggestions.first
+        }
+        guard !plan.replacements.isEmpty else {
+            let msg = plan.skipped > 0 ? "Fixed 0 · skipped \(plan.skipped)" : "Nothing to fix"
+            saveStatus = msg
+            return msg
+        }
+        // Back-to-front via applyEdit
+        for rep in plan.replacements.sorted(by: { $0.range.location > $1.range.location }) {
+            guard canEdit(range: rep.range, replacement: rep.replacement) else { continue }
+            applyEdit(range: rep.range, replacement: rep.replacement)
+            _ = correctionLog.record(wrong: rep.original, correct: rep.replacement)
+        }
+        activeSuggestion = nil
+        let msg = "Fixed \(plan.replacements.count) · skipped \(plan.skipped)"
+        saveStatus = msg
+        scheduleSpellCheck(autoPopup: false)
+        return msg
     }
 
     func markDirtyFromEditor() {

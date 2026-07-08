@@ -69,6 +69,52 @@ public enum LockedSpanMath {
         spans.contains { $0.blocksEdit(in: edit) }
     }
 
+    /// True if every UTF-16 unit of `range` is covered by some locked span.
+    public static func fullyLocked(_ range: NSRange, spans: [LockedSpan]) -> Bool {
+        guard range.length > 0 else {
+            return anyBlocks(spans, edit: range)
+        }
+        let unlocked = unlockedSegments(of: range, spans: spans)
+        return unlocked.isEmpty
+    }
+
+    /// True if `range` overlaps any lock and also has unlocked content.
+    public static func isMixedSelection(_ range: NSRange, spans: [LockedSpan]) -> Bool {
+        guard range.length > 0 else { return false }
+        let overlapsLock = spans.contains { NSIntersectionRange($0.utf16Range, range).length > 0 }
+        let unlocked = unlockedSegments(of: range, spans: spans)
+        return overlapsLock && !unlocked.isEmpty
+    }
+
+    /// Sub-ranges of `range` not covered by any locked span (normalized).
+    public static func unlockedSegments(of range: NSRange, spans: [LockedSpan]) -> [NSRange] {
+        guard range.length > 0 else { return [] }
+        let rangeEnd = range.location + range.length
+        let norm = normalize(spans)
+        // Collect overlaps with range, clipped.
+        var lockedInRange: [NSRange] = []
+        for span in norm {
+            let inter = NSIntersectionRange(span.utf16Range, range)
+            if inter.length > 0 {
+                lockedInRange.append(inter)
+            }
+        }
+        lockedInRange.sort { $0.location < $1.location }
+
+        var result: [NSRange] = []
+        var cursor = range.location
+        for lock in lockedInRange {
+            if lock.location > cursor {
+                result.append(NSRange(location: cursor, length: lock.location - cursor))
+            }
+            cursor = max(cursor, lock.location + lock.length)
+        }
+        if cursor < rangeEnd {
+            result.append(NSRange(location: cursor, length: rangeEnd - cursor))
+        }
+        return result.filter { $0.length > 0 }
+    }
+
     /// After a permitted edit (must not overlap locks), shift spans after the edit point.
     public static func adjusting(
         _ spans: [LockedSpan],
@@ -88,6 +134,15 @@ public enum LockedSpanMath {
             // Overlap: drop (should not occur if edits are gated).
         }
         return normalize(result)
+    }
+
+    /// Apply several pure deletions back-to-front and return new spans (for tests / batch).
+    public static func applyingDeletions(_ spans: [LockedSpan], segments: [NSRange]) -> [LockedSpan] {
+        var current = spans
+        for seg in segments.sorted(by: { $0.location > $1.location }) {
+            current = adjusting(current, edited: seg, replacementLength: 0)
+        }
+        return current
     }
 
     public static func clamp(_ spans: [LockedSpan], toTextLength len: Int) -> [LockedSpan] {

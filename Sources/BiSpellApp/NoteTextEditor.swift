@@ -23,8 +23,14 @@ struct NoteTextEditor: NSViewRepresentable {
     var onDismissSuggestions: (() -> Void)?
     /// Return false to block edits that hit locked spans.
     var canEdit: ((NSRange, String) -> Bool)?
-    /// Optional: view model applies edit + lock shifting (preferred).
-    var applyEdit: ((NSRange, String) -> Void)?
+    /// After NSTextView applies an allowed edit (A1): commit model + span adjust.
+    var commitEditorChange: ((String, NSRange, String, [LockedSpan]) -> Void)?
+    /// Smart multi-delete of unlocked segments (B3).
+    var smartDelete: ((NSRange) -> Void)?
+    /// Snapshot of locked spans before an edit (for commit).
+    var currentLockedSpans: () -> [LockedSpan] = { [] }
+    var onBlockedEdit: (() -> Void)?
+    var restoreSnapshot: ((String, [LockedSpan], NSRange) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -71,7 +77,7 @@ struct NoteTextEditor: NSViewRepresentable {
         scroll.documentView = textView
         context.coordinator.textView = textView
         context.coordinator.installKeyMonitor()
-        context.coordinator.paintLockedSpans()
+        context.coordinator.paintLockedSpans(force: true)
         return scroll
     }
 
@@ -113,7 +119,7 @@ struct NoteTextEditor: NSViewRepresentable {
             textView.backgroundColor = backgroundColor
             scrollView.backgroundColor = backgroundColor
         }
-        context.coordinator.paintLockedSpans()
+        context.coordinator.paintLockedSpans(force: false)
         context.coordinator.syncSuggestionPopup()
     }
 
@@ -134,6 +140,11 @@ struct NoteTextEditor: NSViewRepresentable {
         weak var textView: NoteNSTextView?
         private var keyMonitor: Any?
         private var popup: NotesSuggestionPanel?
+        /// Captured in shouldChangeTextIn for the return-true undo path (A1).
+        private var pendingEdit: (range: NSRange, replacement: String, preSpans: [LockedSpan])?
+        private var lastPaintSignature: String = ""
+        /// Prevent re-entrant textDidChange while smart-delete mutates storage.
+        private var isProgrammaticEdit = false
 
         init(_ parent: NoteTextEditor) {
             self.parent = parent
@@ -184,66 +195,114 @@ struct NoteTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if isProgrammaticEdit { return true }
             let replacement = replacementString ?? ""
+            let spans = parent.currentLockedSpans()
+
+            // B3: pure deletion over mixed locked/unlocked selection → smart delete.
+            if replacement.isEmpty, affectedCharRange.length > 0,
+               LockedSpanMath.isMixedSelection(affectedCharRange, spans: spans) {
+                performSmartDelete(in: textView, range: affectedCharRange)
+                return false
+            }
+
+            // Fully locked (or insertion inside lock): block.
+            if LockedSpanMath.anyBlocks(spans, edit: affectedCharRange) {
+                // Mixed typing-over-selection is also blocked here (not pure deletion).
+                NSSound.beep()
+                parent.onBlockedEdit?()
+                return false
+            }
             if let canEdit = parent.canEdit, !canEdit(affectedCharRange, replacement) {
                 NSSound.beep()
+                parent.onBlockedEdit?()
                 return false
             }
-            if let applyEdit = parent.applyEdit {
-                let oldText = textView.string
-                applyEdit(affectedCharRange, replacement)
-                // Apply in the text view ourselves so we can keep lock attributes in sync.
-                if let storage = textView.textStorage {
-                    storage.beginEditing()
-                    storage.replaceCharacters(in: affectedCharRange, with: replacement)
-                    storage.endEditing()
-                } else {
-                    textView.replaceCharacters(in: affectedCharRange, with: replacement)
-                }
-                let caret = affectedCharRange.location + (replacement as NSString).length
-                textView.setSelectedRange(NSRange(location: caret, length: 0))
-                parent.selectedRange = NSRange(location: caret, length: 0)
-                // Keep binding text in sync without re-entrant setBody races.
-                if parent.text != textView.string {
-                    parent.text = textView.string
-                }
-                parent.onEditingChanged?()
-                paintLockedSpans()
-                if didCrossWordBoundary(from: oldText, to: textView.string, caret: caret) {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.parent.onWordBoundary?()
-                    }
-                }
-                return false
-            }
+
+            // A1: let NSTextView apply (registers undo); commit model in textDidChange.
+            pendingEdit = (affectedCharRange, replacement, spans)
             return true
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
-            // Used when applyEdit is not provided (fallback).
+            if isProgrammaticEdit { return }
+
             let newText = textView.string
             let oldText = parent.text
-            if newText != oldText {
+            let caret = textView.selectedRange().location
+
+            if let pending = pendingEdit {
+                pendingEdit = nil
+                parent.commitEditorChange?(newText, pending.range, pending.replacement, pending.preSpans)
+            } else if newText != oldText {
+                // Fallback (paste etc. without pending) — replace whole model text, clamp spans.
                 parent.text = newText
             }
+
             parent.selectedRange = textView.selectedRange()
             parent.onEditingChanged?()
-            paintLockedSpans()
+            paintLockedSpans(force: false)
 
-            if didCrossWordBoundary(from: oldText, to: newText, caret: textView.selectedRange().location) {
+            if didCrossWordBoundary(from: oldText, to: newText, caret: caret) {
                 DispatchQueue.main.async { [weak self] in
                     self?.parent.onWordBoundary?()
                 }
             }
         }
 
-        func paintLockedSpans() {
+        private func performSmartDelete(in textView: NSTextView, range: NSRange) {
+            let beforeText = textView.string
+            let beforeSpans = parent.currentLockedSpans()
+            let beforeSel = textView.selectedRange()
+            parent.smartDelete?(range)
+            // Sync text view from model
+            let afterText = parent.text
+            let afterSel = parent.selectedRange
+            isProgrammaticEdit = true
+            if let storage = textView.textStorage {
+                storage.beginEditing()
+                storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: afterText)
+                storage.endEditing()
+            } else {
+                textView.string = afterText
+            }
+            textView.setSelectedRange(afterSel)
+            isProgrammaticEdit = false
+            paintLockedSpans(force: true)
+            parent.onEditingChanged?()
+
+            // One undo step restoring text + locks (A1/B3).
+            if let um = textView.undoManager {
+                um.registerUndo(withTarget: textView) { [weak self] tv in
+                    guard let self else { return }
+                    self.parent.restoreSnapshot?(beforeText, beforeSpans, beforeSel)
+                    self.isProgrammaticEdit = true
+                    if let storage = tv.textStorage {
+                        storage.beginEditing()
+                        storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: beforeText)
+                        storage.endEditing()
+                    } else {
+                        tv.string = beforeText
+                    }
+                    tv.setSelectedRange(beforeSel)
+                    self.isProgrammaticEdit = false
+                    self.paintLockedSpans(force: true)
+                }
+                um.setActionName("Smart Delete")
+            }
+            _ = afterText
+        }
+
+                func paintLockedSpans(force: Bool = true) {
             guard let textView, let storage = textView.textStorage else { return }
+            let sig = paintSignature(storageLength: storage.length)
+            if !force, sig == lastPaintSignature { return }
+            lastPaintSignature = sig
+
             let full = NSRange(location: 0, length: storage.length)
             storage.beginEditing()
             storage.removeAttribute(.backgroundColor, range: full)
-            // Restore base text color
             storage.addAttribute(.foregroundColor, value: parent.textColor, range: full)
             storage.addAttribute(.font, value: parent.editorFont, range: full)
             for span in parent.lockedSpans {
@@ -256,6 +315,14 @@ struct NoteTextEditor: NSViewRepresentable {
                 storage.addAttribute(.backgroundColor, value: parent.lockedBackgroundColor, range: r)
             }
             storage.endEditing()
+        }
+
+        private func paintSignature(storageLength: Int) -> String {
+            let spans = parent.lockedSpans.map { "\($0.location):\($0.length)" }.joined(separator: ",")
+            let fontName = parent.editorFont.fontName
+            let fontSize = parent.editorFont.pointSize
+            // Color identity via description is enough for theme switches.
+            return "\(storageLength)|\(spans)|\(fontName)|\(fontSize)|\(parent.textColor)|\(parent.lockedBackgroundColor)|\(parent.backgroundColor)"
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -335,6 +402,20 @@ struct NoteTextEditor: NSViewRepresentable {
 final class NoteNSTextView: NSTextView {
     var onCommandNumber: ((Int) -> Void)?
     var onEscape: (() -> Void)?
+
+    /// Copy full selection (including locked text), then delete via normal pipeline (smart-delete if mixed).
+    override func cut(_ sender: Any?) {
+        copy(sender)
+        let range = selectedRange()
+        guard range.length > 0 else { return }
+        if shouldChangeText(in: range, replacementString: "") {
+            // Fully unlocked deletion — let default path run through replace + didChangeText
+            textStorage?.replaceCharacters(in: range, with: "")
+            setSelectedRange(NSRange(location: range.location, length: 0))
+            didChangeText()
+        }
+        // Mixed/locked: shouldChangeText returned false after handling (smart delete or block).
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.type == .keyDown,

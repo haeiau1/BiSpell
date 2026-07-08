@@ -1,12 +1,17 @@
+
 import AppKit
 import Carbon
 
-/// Global hotkey: ⌥⌘. (Option-Command-Period) opens correction popup / selection check.
+/// Global hotkeys:
+/// - ⌥⌘.  suggestion / check
+/// - ⌥⌘/  fix-all top suggestions
 @MainActor
 final class HotkeyManager {
-    private var hotKeyRef: EventHotKeyRef?
+    private var checkHotKeyRef: EventHotKeyRef?
+    private var fixAllHotKeyRef: EventHotKeyRef?
     private var handler: EventHandlerRef?
     var onHotkey: (() -> Void)?
+    var onFixAllHotkey: (() -> Void)?
 
     func register() {
         unregister()
@@ -26,32 +31,36 @@ final class HotkeyManager {
                 nil,
                 &hotKeyID
             )
-            if hotKeyID.id == 1 {
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                if hotKeyID.id == 1 {
                     manager.onHotkey?()
+                } else if hotKeyID.id == 2 {
+                    manager.onFixAllHotkey?()
                 }
             }
             return noErr
         }, 1, &eventType, userData, &handler)
 
-        let hotKeyID = EventHotKeyID(signature: OSType(0x4253504C), id: 1) // 'BSPL'
-        // kVK_ANSI_Period = 0x2F, option+command
         let modifiers = UInt32(optionKey | cmdKey)
-        RegisterEventHotKey(UInt32(kVK_ANSI_Period), modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+        let checkID = EventHotKeyID(signature: OSType(0x4253504C), id: 1) // BSPL
+        RegisterEventHotKey(UInt32(kVK_ANSI_Period), modifiers, checkID, GetApplicationEventTarget(), 0, &checkHotKeyRef)
+        // kVK_ANSI_Slash = 0x2C
+        let fixID = EventHotKeyID(signature: OSType(0x4253504C), id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_Slash), modifiers, fixID, GetApplicationEventTarget(), 0, &fixAllHotKeyRef)
     }
 
     func unregister() {
-        if let hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
+        if let checkHotKeyRef {
+            UnregisterEventHotKey(checkHotKeyRef)
+            self.checkHotKeyRef = nil
+        }
+        if let fixAllHotKeyRef {
+            UnregisterEventHotKey(fixAllHotKeyRef)
+            self.fixAllHotKeyRef = nil
         }
         if let handler {
             RemoveEventHandler(handler)
             self.handler = nil
         }
-    }
-
-    deinit {
-        // Cannot call MainActor in deinit safely; best-effort
     }
 }

@@ -82,6 +82,7 @@ public final class CorrectionLogStore: @unchecked Sendable {
         guard w.caseInsensitiveCompare(c) != .orderedSame else { return nil }
 
         return queue.sync {
+            reloadFromDiskLocked()
             let id = CorrectionRecord.makeID(wrong: w, correct: c)
             if let idx = file.corrections.firstIndex(where: { $0.id == id }) {
                 file.corrections[idx].count += 1
@@ -114,6 +115,13 @@ public final class CorrectionLogStore: @unchecked Sendable {
     public func topCorrections(limit: Int = 50) -> [CorrectionRecord] {
         queue.sync {
             Array(file.corrections.sorted { $0.count > $1.count }.prefix(limit))
+        }
+    }
+
+    private func reloadFromDiskLocked() {
+        if let data = try? Data(contentsOf: url),
+           let decoded = try? decoder.decode(CorrectionLogFile.self, from: data) {
+            file = decoded
         }
     }
 

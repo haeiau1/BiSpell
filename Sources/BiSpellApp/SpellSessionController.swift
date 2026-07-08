@@ -18,6 +18,7 @@ final class SpellSessionController: ObservableObject {
     @Published var accessibilityGranted: Bool = AccessibilityPermission.isGranted
 
     let engine: SpellEngine
+    private let correctionLog = CorrectionLogStore()
     private let settingsStore = SettingsStore()
     private let overlay = OverlayController()
 
@@ -201,6 +202,75 @@ final class SpellSessionController: ObservableObject {
         if let target = engine.nearestMisspelling(in: lastMisspellings, caretUTF16: lastCaret) ?? lastMisspellings.first {
             let filled = engine.withSuggestions(target)
             overlay.showPopup(for: filled, force: true, utf16Offset: lastTextOffset)
+        }
+    }
+
+
+    /// ⌥⌘/ — apply top suggestion to every misspelling in selection (or whole field).
+    func hotkeyFixAll() {
+        guard settings.hotkeyFallbackEnabled else { return }
+        guard settings.isEnabled, !isPaused else { return }
+        guard accessibilityGranted else { return }
+
+        guard let snap = AXTextAccess.snapshot(
+            deniedBundleIDs: settings.deniedBundleIDs,
+            electronSupportEnabled: settings.electronSupportEnabled
+        ), snap.canReadValue, !snap.text.isEmpty else {
+            setIfChanged(\.lastSnapshotSummary, "No readable field")
+            return
+        }
+
+        let ns = snap.text as NSString
+        var checkText = snap.text
+        var baseLocation = 0
+        if let sel = snap.selectedRange, sel.length > 0,
+           sel.location + sel.length <= ns.length {
+            checkText = ns.substring(with: sel)
+            baseLocation = sel.location
+        }
+
+        let result = engine.check(text: checkText, bundleID: snap.bundleID, nearCaretOnly: false)
+        var replacements: [TextReplacement] = []
+        var skipped = 0
+        for m in result.misspellings {
+            let filled = engine.withSuggestions(m)
+            if let top = filled.suggestions.first {
+                let mapped = NSRange(
+                    location: baseLocation + filled.utf16Range.location,
+                    length: filled.utf16Range.length
+                )
+                replacements.append(TextReplacement(
+                    range: mapped,
+                    original: filled.word,
+                    replacement: top
+                ))
+            } else {
+                skipped += 1
+            }
+        }
+
+        var fixed = 0
+        for rep in replacements.sorted(by: { $0.range.location > $1.range.location }) {
+            let ok = AXTextAccess.replaceUTF16Range(
+                in: snap.text,
+                range: rep.range,
+                with: rep.replacement,
+                textUTF16Offset: snap.textUTF16Offset,
+                useClipboardFallback: settings.useClipboardFallback
+            )
+            if ok {
+                fixed += 1
+                _ = correctionLog.record(wrong: rep.original, correct: rep.replacement)
+            } else {
+                skipped += 1
+            }
+        }
+
+        setIfChanged(\.lastSnapshotSummary, "Fixed \(fixed) · skipped \(skipped)")
+        if fixed > 0 {
+            lastText = ""
+            lastCharCount = -1
+            recheckNow(forceFull: true)
         }
     }
 

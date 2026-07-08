@@ -36,6 +36,10 @@ struct BiSpellApp: App {
                     appModel.handleSuggestionHotkey()
                 }
                 .keyboardShortcut(".", modifiers: [.command, .option])
+                Button("Fix All (Top Suggestions)") {
+                    appModel.handleFixAllHotkey()
+                }
+                .keyboardShortcut("/", modifiers: [.command, .option])
                 Button("Accept Suggestion 1 (best)") { appModel.notesViewModel.applySuggestionShortcut(number: 1) }
                     .keyboardShortcut("1", modifiers: [.command])
                 Button("Accept Suggestion 2") { appModel.notesViewModel.applySuggestionShortcut(number: 2) }
@@ -84,6 +88,9 @@ private struct MenuContent: View {
         Divider()
         Button("Check Now / Show Suggestion  (⌥⌘.)") {
             appModel.handleSuggestionHotkey()
+        }
+        Button("Fix All Top Suggestions  (⌥⌘/)") {
+            appModel.handleFixAllHotkey()
         }
         Button("Probe Frontmost App Support") {
             session.probeSupport()
@@ -186,6 +193,15 @@ final class AppModel: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
 
+    /// Route ⌥⌘/ fix-all similarly.
+    func handleFixAllHotkey() {
+        if isNotesWindowKey {
+            _ = notesViewModel.fixAllMisspellings()
+        } else {
+            session.hotkeyFixAll()
+        }
+    }
+
     private var isNotesWindowKey: Bool {
         guard let key = NSApp.keyWindow else {
             // If BiSpell is active and a notes window exists, prefer notes.
@@ -225,6 +241,9 @@ final class AppModel: NSObject, NSApplicationDelegate, ObservableObject {
         }
         hotkeys.onHotkey = { [weak self] in
             self?.handleSuggestionHotkey()
+        }
+        hotkeys.onFixAllHotkey = { [weak self] in
+            self?.handleFixAllHotkey()
         }
         hotkeys.register()
         LaunchAtLogin.setEnabled(session.settings.launchAtLogin)
