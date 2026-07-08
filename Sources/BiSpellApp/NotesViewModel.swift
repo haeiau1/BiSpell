@@ -21,6 +21,7 @@ final class NotesViewModel: ObservableObject {
     private let store: NotesStore
     private let engine: SpellEngine?
     private let correctionLog: CorrectionLogStore
+    let editorBridge = NoteEditorBridge()
     private var checkWork: DispatchWorkItem?
 
     init(
@@ -303,14 +304,25 @@ final class NotesViewModel: ObservableObject {
             saveStatus = msg
             return msg
         }
-        // Back-to-front via applyEdit
-        for rep in plan.replacements.sorted(by: { $0.range.location > $1.range.location }) {
-            guard canEdit(range: rep.range, replacement: rep.replacement) else { continue }
-            applyEdit(range: rep.range, replacement: rep.replacement)
-            _ = correctionLog.record(wrong: rep.original, correct: rep.replacement)
+        let sorted = plan.replacements.sorted(by: { $0.range.location > $1.range.location })
+        let items = sorted.compactMap { rep -> (range: NSRange, replacement: String)? in
+            guard canEdit(range: rep.range, replacement: rep.replacement) else { return nil }
+            return (rep.range, rep.replacement)
+        }
+        if editorBridge.isConnected, !items.isEmpty {
+            editorBridge.replaceMany(items, actionName: "Fix All")
+        } else {
+            for item in items {
+                applyEdit(range: item.range, replacement: item.replacement)
+            }
+        }
+        for rep in sorted {
+            if items.contains(where: { $0.range == rep.range && $0.replacement == rep.replacement }) {
+                _ = correctionLog.record(wrong: rep.original, correct: rep.replacement)
+            }
         }
         activeSuggestion = nil
-        let msg = "Fixed \(plan.replacements.count) · skipped \(plan.skipped)"
+        let msg = "Fixed \(items.count) · skipped \(plan.skipped + (plan.replacements.count - items.count))"
         saveStatus = msg
         scheduleSpellCheck(autoPopup: false)
         return msg
@@ -354,7 +366,11 @@ final class NotesViewModel: ObservableObject {
             return
         }
         let wrong = misspelling.word
-        applyEdit(range: range, replacement: suggestion)
+        if editorBridge.isConnected {
+            editorBridge.replace(range: range, with: suggestion, actionName: "Spelling")
+        } else {
+            applyEdit(range: range, replacement: suggestion)
+        }
         activeSuggestion = nil
         _ = correctionLog.record(wrong: wrong, correct: suggestion)
         saveStatus = "Fixed “\(wrong)” → \(suggestion)"

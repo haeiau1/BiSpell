@@ -52,6 +52,22 @@ final class LockedSpanTests: XCTestCase {
         ])
     }
 
+    func testAdjacentLocksDoNotMerge() {
+        // After deleting a single space between two locks, spans become adjacent — must stay separate.
+        let spans = [
+            LockedSpan(location: 0, length: 3),
+            LockedSpan(location: 3, length: 3)
+        ]
+        let norm = LockedSpanMath.normalize(spans)
+        XCTAssertEqual(norm.count, 2, "Adjacent locks must not merge into one block")
+        XCTAssertEqual(norm[0].location, 0)
+        XCTAssertEqual(norm[0].length, 3)
+        XCTAssertEqual(norm[1].location, 3)
+        XCTAssertEqual(norm[1].length, 3)
+        // Caret between them (at 3) is at the edge of both — insertion allowed.
+        XCTAssertFalse(LockedSpanMath.anyBlocks(norm, edit: NSRange(location: 3, length: 0)))
+    }
+
     func testApplyingDeletionsShiftsLocks() {
         // "AAA LOCK BBB" — lock at 4 len 4 after "AAA "
         let spans = [LockedSpan(location: 4, length: 4)]

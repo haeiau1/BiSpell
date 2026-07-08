@@ -38,7 +38,9 @@ public enum LockedSpanMath {
         var out: [LockedSpan] = []
         for span in sorted.dropFirst() {
             let currentEnd = current.location + current.length
-            if span.location <= currentEnd {
+            // Merge only true overlaps — keep adjacent locks separate so the user
+            // can still insert (e.g. a space) between two locked blocks.
+            if span.location < currentEnd {
                 let end = max(currentEnd, span.location + span.length)
                 current = LockedSpan(location: current.location, length: end - current.location)
             } else {

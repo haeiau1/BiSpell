@@ -4,6 +4,7 @@ import BiSpellCore
 
 /// NSTextView with caret tracking, word-boundary hooks, and reliable ⌘1–⌘5 capture.
 struct NoteTextEditor: NSViewRepresentable {
+    var editorBridge: NoteEditorBridge? = nil
     @Binding var text: String
     @Binding var selectedRange: NSRange
     /// When non-nil, show floating suggestion popup near the misspelling/caret.
@@ -76,6 +77,8 @@ struct NoteTextEditor: NSViewRepresentable {
 
         scroll.documentView = textView
         context.coordinator.textView = textView
+        context.coordinator.editorBridge = editorBridge
+        editorBridge?.coordinator = context.coordinator
         context.coordinator.installKeyMonitor()
         context.coordinator.paintLockedSpans(force: true)
         return scroll
@@ -84,6 +87,8 @@ struct NoteTextEditor: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NoteNSTextView else { return }
         context.coordinator.parent = self
+        context.coordinator.editorBridge = editorBridge
+        editorBridge?.coordinator = context.coordinator
         textView.onCommandNumber = { [weak coordinator = context.coordinator] n in
             coordinator?.parent.onCommandNumber?(n)
         }
@@ -108,18 +113,32 @@ struct NoteTextEditor: NSViewRepresentable {
             }
         }
         textView.isEditable = isEditable
+        var appearanceChanged = false
         if textView.font != editorFont {
             textView.font = editorFont
+            appearanceChanged = true
         }
         if textView.textColor != textColor {
             textView.textColor = textColor
             textView.insertionPointColor = textColor
+            appearanceChanged = true
         }
         if textView.backgroundColor != backgroundColor {
             textView.backgroundColor = backgroundColor
             scrollView.backgroundColor = backgroundColor
+            appearanceChanged = true
         }
-        context.coordinator.paintLockedSpans(force: false)
+        textView.typingAttributes = [
+            .font: editorFont,
+            .foregroundColor: textColor
+        ]
+        // Only force repaint when locks/theme change; not on every keystroke text sync.
+        let lockSig = lockedSpans.map { "\($0.location):\($0.length)" }.joined(separator: ",")
+        if appearanceChanged || context.coordinator.needsLockRepaint(lockSig) {
+            context.coordinator.paintLockedSpans(force: true)
+        } else {
+            context.coordinator.paintLockedSpans(force: false)
+        }
         context.coordinator.syncSuggestionPopup()
     }
 
@@ -138,13 +157,23 @@ struct NoteTextEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: NoteTextEditor
         weak var textView: NoteNSTextView?
+        weak var editorBridge: NoteEditorBridge?
         private var keyMonitor: Any?
         private var popup: NotesSuggestionPanel?
         /// Captured in shouldChangeTextIn for the return-true undo path (A1).
         private var pendingEdit: (range: NSRange, replacement: String, preSpans: [LockedSpan])?
         private var lastPaintSignature: String = ""
+        private var lastLockSig: String = ""
         /// Prevent re-entrant textDidChange while smart-delete mutates storage.
         private var isProgrammaticEdit = false
+
+        func needsLockRepaint(_ lockSig: String) -> Bool {
+            if lockSig != lastLockSig {
+                lastLockSig = lockSig
+                return true
+            }
+            return false
+        }
 
         init(_ parent: NoteTextEditor) {
             self.parent = parent
@@ -183,6 +212,9 @@ struct NoteTextEditor: NSViewRepresentable {
             if let keyMonitor {
                 NSEvent.removeMonitor(keyMonitor)
                 self.keyMonitor = nil
+            }
+            if editorBridge?.coordinator === self {
+                editorBridge?.coordinator = nil
             }
             popup?.close()
             popup = nil
@@ -242,7 +274,10 @@ struct NoteTextEditor: NSViewRepresentable {
 
             parent.selectedRange = textView.selectedRange()
             parent.onEditingChanged?()
-            paintLockedSpans(force: false)
+            // Avoid full-doc paint work when nothing is locked.
+            if !parent.lockedSpans.isEmpty {
+                paintLockedSpans(force: false)
+            }
 
             if didCrossWordBoundary(from: oldText, to: newText, caret: caret) {
                 DispatchQueue.main.async { [weak self] in
@@ -294,18 +329,97 @@ struct NoteTextEditor: NSViewRepresentable {
             _ = afterText
         }
 
-                func paintLockedSpans(force: Bool = true) {
+        /// Undoable single replacement (suggestions / cmd+1). Uses model snapshot undo so
+        /// ⌘Z restores both text and locked-span positions.
+        func performUndoableReplacement(range: NSRange, replacement: String, actionName: String) {
+            performUndoableReplacements([(range, replacement)], actionName: actionName)
+        }
+
+        /// Undoable multi-replacement (Fix All), one undo group.
+        func performUndoableReplacements(
+            _ items: [(range: NSRange, replacement: String)],
+            actionName: String
+        ) {
+            guard let textView else { return }
+            let sorted = items.sorted { $0.range.location > $1.range.location }
+            guard !sorted.isEmpty else { return }
+
+            let beforeText = textView.string
+            let beforeSpans = parent.currentLockedSpans()
+            let beforeSel = textView.selectedRange()
+
+            // Apply back-to-front on model via smart path that also updates draft.
+            for item in sorted {
+                let preSpans = parent.currentLockedSpans()
+                if LockedSpanMath.anyBlocks(preSpans, edit: item.range) { continue }
+                let ns = parent.text as NSString
+                guard item.range.location + item.range.length <= ns.length else { continue }
+                let newText = ns.replacingCharacters(in: item.range, with: item.replacement)
+                parent.commitEditorChange?(newText, item.range, item.replacement, preSpans)
+            }
+
+            let afterText = parent.text
+            let afterSel = parent.selectedRange
+
+            isProgrammaticEdit = true
+            if let storage = textView.textStorage {
+                storage.beginEditing()
+                storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: afterText)
+                storage.endEditing()
+            } else {
+                textView.string = afterText
+            }
+            textView.setSelectedRange(afterSel)
+            isProgrammaticEdit = false
+            paintLockedSpans(force: true)
+            parent.onEditingChanged?()
+
+            if let um = textView.undoManager {
+                um.registerUndo(withTarget: textView) { [weak self] tv in
+                    guard let self else { return }
+                    self.parent.restoreSnapshot?(beforeText, beforeSpans, beforeSel)
+                    self.isProgrammaticEdit = true
+                    if let storage = tv.textStorage {
+                        storage.beginEditing()
+                        storage.replaceCharacters(in: NSRange(location: 0, length: storage.length), with: beforeText)
+                        storage.endEditing()
+                    } else {
+                        tv.string = beforeText
+                    }
+                    tv.setSelectedRange(beforeSel)
+                    self.isProgrammaticEdit = false
+                    self.paintLockedSpans(force: true)
+                }
+                um.setActionName(actionName)
+            }
+        }
+
+        func paintLockedSpans(force: Bool = true) {
             guard let textView, let storage = textView.textStorage else { return }
-            let sig = paintSignature(storageLength: storage.length)
+            let spans = parent.lockedSpans
+
+            // No locks: only clear stale highlight once (do not touch font/colors every keystroke).
+            if spans.isEmpty {
+                if lastPaintSignature == "empty" { return }
+                let full = NSRange(location: 0, length: storage.length)
+                if storage.length > 0 {
+                    storage.beginEditing()
+                    storage.removeAttribute(.backgroundColor, range: full)
+                    storage.endEditing()
+                }
+                lastPaintSignature = "empty"
+                return
+            }
+
+            let sig = paintSignature()
             if !force, sig == lastPaintSignature { return }
             lastPaintSignature = sig
 
             let full = NSRange(location: 0, length: storage.length)
             storage.beginEditing()
+            // Only manage lock highlight backgrounds — typing path sets font via typingAttributes.
             storage.removeAttribute(.backgroundColor, range: full)
-            storage.addAttribute(.foregroundColor, value: parent.textColor, range: full)
-            storage.addAttribute(.font, value: parent.editorFont, range: full)
-            for span in parent.lockedSpans {
+            for span in spans {
                 var r = span.utf16Range
                 if r.location >= storage.length { continue }
                 if r.location + r.length > storage.length {
@@ -317,12 +431,9 @@ struct NoteTextEditor: NSViewRepresentable {
             storage.endEditing()
         }
 
-        private func paintSignature(storageLength: Int) -> String {
+        private func paintSignature() -> String {
             let spans = parent.lockedSpans.map { "\($0.location):\($0.length)" }.joined(separator: ",")
-            let fontName = parent.editorFont.fontName
-            let fontSize = parent.editorFont.pointSize
-            // Color identity via description is enough for theme switches.
-            return "\(storageLength)|\(spans)|\(fontName)|\(fontSize)|\(parent.textColor)|\(parent.lockedBackgroundColor)|\(parent.backgroundColor)"
+            return "\(spans)|\(parent.lockedBackgroundColor)"
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {

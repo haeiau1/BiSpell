@@ -88,31 +88,37 @@ struct NotesRootView: View {
                 .disabled(!viewModel.canUnlockSelection)
                 .help("Unlock selection or span at caret")
 
+                Button { attemptNewNote() } label: {
+                    Label("New Note", systemImage: "square.and.pencil")
+                }
+                .help("New note (⌘N)")
+
+                Button { attemptNewTemplate() } label: {
+                    Label("New Template", systemImage: "doc.badge.plus")
+                }
+                .help("New template")
+
                 Menu {
-                    Button("New Note") { attemptNewNote() }
-                    Button("New Template") { attemptNewTemplate() }
-                    if !viewModel.templateNotes.isEmpty {
-                        Menu("New Note from Template") {
-                            ForEach(viewModel.templateNotes) { tmpl in
-                                Button(tmpl.displayTitle) {
-                                    attemptNewFromTemplate(tmpl.id)
-                                }
+                    if viewModel.templateNotes.isEmpty {
+                        Text("No templates yet")
+                    } else {
+                        ForEach(viewModel.templateNotes) { tmpl in
+                            Button(tmpl.displayTitle) {
+                                attemptNewFromTemplate(tmpl.id)
                             }
                         }
                     }
                     if viewModel.draftIsTemplate {
-                        Button("New Note from This Template") {
-                            if let id = viewModel.selectedNoteID {
-                                attemptNewFromTemplate(id)
-                            }
-                        }
+                        Divider()
                         Button("Move to Notes") { viewModel.convertTemplateToNote() }
                     } else if viewModel.selectedNoteID != nil {
+                        Divider()
                         Button("Move to Templates") { viewModel.saveCurrentAsTemplate() }
                     }
                 } label: {
-                    Label("New", systemImage: "square.and.pencil")
+                    Label("From Template", systemImage: "doc.on.doc")
                 }
+                .help("New note from a template")
 
                 Button {
                     _ = viewModel.fixAllMisspellings()
@@ -308,6 +314,7 @@ struct NotesRootView: View {
                 Divider()
 
                 NoteTextEditor(
+                    editorBridge: viewModel.editorBridge,
                     text: viewModel.bodyBinding,
                     selectedRange: $viewModel.selectedRange,
                     activeMisspelling: viewModel.activeSuggestion,
