@@ -182,12 +182,12 @@ struct NotesCommandStrip: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .help("Today / template / from template")
+        .help("Today / template / apply template")
     }
 
     private var locksMenu: some View {
         Menu {
-            Button("Lock selection…") { onLock() }
+            Button("Lock selection") { onLock() }
                 .disabled(!viewModel.canLockSelection)
             Button("Unlock selection") { viewModel.unlockSelection() }
                 .disabled(!viewModel.canUnlockSelection)
@@ -196,7 +196,7 @@ struct NotesCommandStrip: View {
                 Text("No locked regions")
             } else {
                 ForEach(Array(viewModel.draftLockedSpans.enumerated()), id: \.offset) { index, span in
-                    Button("\(span.displayLabel)  [\(span.location)+\(span.length)]") {
+                    Button("Region \(index + 1)  [\(span.location)+\(span.length)]") {
                         viewModel.jumpToRegion(at: index)
                     }
                 }
@@ -234,7 +234,7 @@ struct NotesCommandStrip: View {
                             } label: {
                                 HStack {
                                     Image(systemName: "lock.fill")
-                                    Text(span.displayLabel)
+                                    Text("Region \(index + 1)")
                                     Spacer()
                                     Text("\(span.location)+\(span.length)")
                                         .foregroundStyle(Color(nsColor: t.textTertiary))

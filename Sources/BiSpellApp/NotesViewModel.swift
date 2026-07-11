@@ -118,9 +118,39 @@ final class NotesViewModel: ObservableObject {
     private var diskWatchTimer: Timer?
     private var knownMTimes: [UUID: Date] = [:]
     private var isApplyingDiskReload = false
+    /// Per-note-session dismissed misspelling occurrences (range + word). Cleared on note switch.
+    /// A newly typed instance of the same word is a different occurrence and may re-flag.
+    private var dismissedOccurrences: [DismissedMisspelling] = []
 
     /// Full-document spell-check is expensive on large markdown imports.
     private static let fullSpellCheckUTF16Limit = 24_000
+
+    /// One dismissed spelling instance on the open note (UTF-16 range + word identity).
+    private struct DismissedMisspelling: Equatable {
+        var location: Int
+        var length: Int
+        var word: String
+
+        var utf16Range: NSRange { NSRange(location: location, length: length) }
+
+        init(location: Int, length: Int, word: String) {
+            self.location = location
+            self.length = length
+            self.word = word
+        }
+
+        init(_ misspelling: Misspelling) {
+            self.location = misspelling.utf16Range.location
+            self.length = misspelling.utf16Range.length
+            self.word = misspelling.word
+        }
+
+        func matches(_ misspelling: Misspelling) -> Bool {
+            location == misspelling.utf16Range.location
+                && length == misspelling.utf16Range.length
+                && word == misspelling.word
+        }
+    }
 
     init(
         store: NotesStore = NotesStore(),
@@ -402,7 +432,8 @@ final class NotesViewModel: ObservableObject {
         }
     }
 
-    /// Start create-from-template. May open variable form. Returns false if dirty (unless force)
+    /// Apply template: appends filled body + locks onto the current note when one is open;
+    /// otherwise creates a new note. May open variable form. Returns false if dirty (unless force)
     /// or if a forced flush fails (draft is kept; status stays "Save failed").
     @discardableResult
     func createNoteFromTemplate(_ templateID: UUID, force: Bool = false) -> Bool {
@@ -435,6 +466,16 @@ final class NotesViewModel: ObservableObject {
         _ = finalizeNoteFromTemplate(template, values: values)
     }
 
+    /// True when we should append template content into the open draft (not replace / not new note).
+    private var shouldAppendTemplateToCurrentNote: Bool {
+        guard let id = selectedNoteID else { return false }
+        // Don't mutate a template document itself — open a new note instead.
+        if draftIsTemplate { return false }
+        // Don't append into the template source when it is the selection.
+        if notes.first(where: { $0.id == id })?.isTemplate == true { return false }
+        return true
+    }
+
     @discardableResult
     private func finalizeNoteFromTemplate(_ template: Note, values: [String: String]) -> Bool {
         let filled = TemplateVariables.fill(
@@ -442,6 +483,61 @@ final class NotesViewModel: ObservableObject {
             locks: template.lockedSpans,
             values: values
         )
+        if shouldAppendTemplateToCurrentNote {
+            return appendTemplateToCurrentNote(filled: filled)
+        }
+        return createNewNoteFromFilledTemplate(template, filled: filled)
+    }
+
+    /// Append filled template body and offset locks to the end of the current draft.
+    /// Existing body text and existing locks are preserved.
+    @discardableResult
+    private func appendTemplateToCurrentNote(filled: TemplateFillResult) -> Bool {
+        let existing = draftBody
+        let existingLen = (existing as NSString).length
+        var separator = ""
+        if existingLen > 0 {
+            if existing.hasSuffix("\n\n") {
+                separator = ""
+            } else if existing.hasSuffix("\n") {
+                separator = "\n"
+            } else {
+                separator = "\n\n"
+            }
+        }
+        let offset = existingLen + (separator as NSString).length
+        let newBody = existing + separator + filled.body
+        let offsetLocks = filled.lockedSpans.map { span in
+            LockedSpan(
+                location: span.location + offset,
+                length: span.length,
+                label: span.label
+            )
+        }
+        // Preserve existing locks; merge appended template locks (normalized).
+        draftBody = newBody
+        draftLockedSpans = LockedSpanMath.normalize(draftLockedSpans + offsetLocks)
+        draftLockedSpans = LockedSpanMath.clamp(
+            draftLockedSpans,
+            toTextLength: (newBody as NSString).length
+        )
+        selectedRange = NSRange(location: (newBody as NSString).length, length: 0)
+        markDirty()
+        mirrorPrimaryDraftToSecondaryIfShared(fields: .body)
+        var status = "Template appended"
+        if filled.filledCount > 0 {
+            status += " · filled \(filled.filledCount)"
+        }
+        if filled.skippedInLocks > 0 {
+            status += " · \(filled.skippedInLocks) in locks skipped"
+        }
+        saveStatus = status
+        scheduleSpellCheck(autoPopup: false)
+        return true
+    }
+
+    @discardableResult
+    private func createNewNoteFromFilledTemplate(_ template: Note, filled: TemplateFillResult) -> Bool {
         let title: String = {
             let t = template.title
             if t == "Untitled template" || t.isEmpty { return "Untitled" }
@@ -731,9 +827,17 @@ final class NotesViewModel: ObservableObject {
 
     func setBody(_ value: String) {
         // Direct set from binding without range math — editor uses applyEdit for gated changes.
+        // Fallback path (undo/paste without pendingEdit): still infer a single edit so dismiss
+        // stickiness matches commitEditorChange rather than prune-only.
         guard draftBody != value else { return }
+        let previous = draftBody
         draftBody = value
         draftLockedSpans = LockedSpanMath.clamp(draftLockedSpans, toTextLength: (value as NSString).length)
+        dismissedOccurrences = reconcileDismissedOnTextChange(
+            dismissedOccurrences,
+            from: previous,
+            to: value
+        )
         markDirty()
         mirrorPrimaryDraftToSecondaryIfShared(fields: .body)
         scheduleSpellCheck(autoPopup: false)
@@ -760,6 +864,12 @@ final class NotesViewModel: ObservableObject {
             replacementLength: (replacement as NSString).length
         )
         draftLockedSpans = LockedSpanMath.clamp(draftLockedSpans, toTextLength: (draftBody as NSString).length)
+        dismissedOccurrences = adjustDismissed(
+            dismissedOccurrences,
+            edited: range,
+            replacementLength: (replacement as NSString).length,
+            in: draftBody
+        )
         let caret = range.location + (replacement as NSString).length
         selectedRange = NSRange(location: caret, length: 0)
         markDirty()
@@ -781,6 +891,12 @@ final class NotesViewModel: ObservableObject {
             replacementLength: (replacement as NSString).length
         )
         draftLockedSpans = LockedSpanMath.clamp(draftLockedSpans, toTextLength: (newText as NSString).length)
+        dismissedOccurrences = adjustDismissed(
+            dismissedOccurrences,
+            edited: edited,
+            replacementLength: (replacement as NSString).length,
+            in: newText
+        )
         selectedRange = NSRange(
             location: edited.location + (replacement as NSString).length,
             length: 0
@@ -803,14 +919,19 @@ final class NotesViewModel: ObservableObject {
         }
         var body = draftBody
         var spans = draftLockedSpans
+        var dismissals = dismissedOccurrences
         for seg in segments.sorted(by: { $0.location > $1.location }) {
             let ns = body as NSString
             guard seg.location + seg.length <= ns.length else { continue }
             body = ns.replacingCharacters(in: seg, with: "")
             spans = LockedSpanMath.adjusting(spans, edited: seg, replacementLength: 0)
+            // Shift/drop dismissals per segment (same rules as locks) so text before a
+            // dismissed word still keeps that occurrence dismissed after the delete.
+            dismissals = adjustDismissed(dismissals, edited: seg, replacementLength: 0, in: body)
         }
         draftBody = body
         draftLockedSpans = LockedSpanMath.clamp(spans, toTextLength: (body as NSString).length)
+        dismissedOccurrences = dismissals
         // Caret at start of original selection (still valid after back-to-front deletes inside range).
         let caret = min(range.location, (body as NSString).length)
         selectedRange = NSRange(location: caret, length: 0)
@@ -821,9 +942,15 @@ final class NotesViewModel: ObservableObject {
     }
 
     func restoreSnapshot(text: String, spans: [LockedSpan], selection: NSRange) {
+        let previous = draftBody
         draftBody = text
         draftLockedSpans = spans
         selectedRange = selection
+        dismissedOccurrences = reconcileDismissedOnTextChange(
+            dismissedOccurrences,
+            from: previous,
+            to: text
+        )
         markDirty()
         mirrorPrimaryDraftToSecondaryIfShared(fields: .body)
         scheduleSpellCheck(autoPopup: false)
@@ -878,14 +1005,15 @@ final class NotesViewModel: ObservableObject {
         scheduleSpellCheck(autoPopup: true, delay: 0.05)
     }
 
-    func lockSelection(label: String? = nil) {
+    func lockSelection(label _: String? = nil) {
         guard selectedRange.length > 0 else {
             saveStatus = "Select text to lock"
             return
         }
-        draftLockedSpans = LockedSpanMath.add(draftLockedSpans, range: selectedRange, label: label)
+        // Lock labels removed from UX — do not store a display label on new locks.
+        draftLockedSpans = LockedSpanMath.add(draftLockedSpans, range: selectedRange, label: nil)
         markDirty()
-        saveStatus = label.map { "Locked “\($0)”" } ?? "Locked selection"
+        saveStatus = "Locked selection"
     }
 
     func unlockSelection() {
@@ -894,16 +1022,18 @@ final class NotesViewModel: ObservableObject {
         saveStatus = "Unlocked"
     }
 
-    func renameRegion(at index: Int, label: String?) {
-        draftLockedSpans = LockedSpanMath.rename(draftLockedSpans, at: index, label: label)
+    func renameRegion(at index: Int, label _: String?) {
+        // Labels removed from UX — keep API but clear any label.
+        draftLockedSpans = LockedSpanMath.rename(draftLockedSpans, at: index, label: nil)
         markDirty()
         saveStatus = "Region updated"
     }
 
     func jumpToRegion(at index: Int) {
         guard draftLockedSpans.indices.contains(index) else { return }
-        selectedRange = draftLockedSpans[index].utf16Range
-        saveStatus = "Region \(draftLockedSpans[index].displayLabel)"
+        let span = draftLockedSpans[index]
+        selectedRange = span.utf16Range
+        saveStatus = "Region [\(span.location)+\(span.length)]"
     }
 
     /// Status-bar action: jump to first misspelling and open suggestions.
@@ -1482,7 +1612,48 @@ final class NotesViewModel: ObservableObject {
     }
 
     func dismissSuggestions() {
+        if let active = activeSuggestion {
+            recordDismissed(active)
+            // Drop from live list so status-bar jump / nearest can't re-popup this instance.
+            misspellings.removeAll {
+                $0.utf16Range == active.utf16Range && $0.word == active.word
+            }
+            if isSameNoteInBothPanes {
+                secondaryMisspellings.removeAll {
+                    $0.utf16Range == active.utf16Range && $0.word == active.word
+                }
+                if let secondaryActive = secondaryActiveSuggestion,
+                   secondaryActive.utf16Range == active.utf16Range,
+                   secondaryActive.word == active.word {
+                    secondaryActiveSuggestion = nil
+                }
+            }
+        }
         activeSuggestion = nil
+    }
+
+    /// Dismiss secondary-pane suggestion popup and remember that occurrence for this note session.
+    func dismissSecondarySuggestions() {
+        if let active = secondaryActiveSuggestion {
+            // Secondary uses its own misspellings list when not sharing the same note;
+            // still record on shared primary dismiss store when same note.
+            recordDismissed(active)
+            secondaryMisspellings.removeAll {
+                $0.utf16Range == active.utf16Range && $0.word == active.word
+            }
+            // Same note both panes: keep primary list in sync so jump/nearest stay dismissed.
+            if isSameNoteInBothPanes {
+                misspellings.removeAll {
+                    $0.utf16Range == active.utf16Range && $0.word == active.word
+                }
+                if let primaryActive = activeSuggestion,
+                   primaryActive.utf16Range == active.utf16Range,
+                   primaryActive.word == active.word {
+                    activeSuggestion = nil
+                }
+            }
+        }
+        secondaryActiveSuggestion = nil
     }
 
     func applySuggestionShortcut(number: Int) {
@@ -1591,6 +1762,8 @@ final class NotesViewModel: ObservableObject {
         }
         misspellings = []
         activeSuggestion = nil
+        // Dismissals are per open-note session.
+        dismissedOccurrences = []
     }
 
     private func syncSecondaryDraftFromID() {
@@ -1645,13 +1818,25 @@ final class NotesViewModel: ObservableObject {
 
     func setSecondaryBody(_ value: String) {
         guard secondaryDraftBody != value else { return }
+        let previous = secondaryDraftBody
         secondaryDraftBody = value
         secondaryDraftLockedSpans = LockedSpanMath.clamp(
             secondaryDraftLockedSpans,
             toTextLength: (value as NSString).length
         )
+        // Same-note split: dismissals live on the shared session — infer edit like primary setBody.
+        if isSameNoteInBothPanes {
+            dismissedOccurrences = reconcileDismissedOnTextChange(
+                dismissedOccurrences,
+                from: previous,
+                to: value
+            )
+        }
         markSecondaryDirty()
         mirrorSecondaryDraftToPrimaryIfShared(fields: .body)
+        if isSameNoteInBothPanes {
+            scheduleSpellCheck(autoPopup: false)
+        }
     }
 
     func setSecondaryFolder(_ value: String) {
@@ -1719,12 +1904,24 @@ final class NotesViewModel: ObservableObject {
             secondaryDraftLockedSpans,
             toTextLength: (newText as NSString).length
         )
+        // Same-note split: shift/drop dismissals with the edit (mirrors primary commitEditorChange).
+        if isSameNoteInBothPanes {
+            dismissedOccurrences = adjustDismissed(
+                dismissedOccurrences,
+                edited: edited,
+                replacementLength: (replacement as NSString).length,
+                in: newText
+            )
+        }
         secondarySelectedRange = NSRange(
             location: edited.location + (replacement as NSString).length,
             length: 0
         )
         markSecondaryDirty()
         mirrorSecondaryDraftToPrimaryIfShared(fields: .body)
+        if isSameNoteInBothPanes {
+            scheduleSpellCheck(autoPopup: false)
+        }
     }
 
     func smartDeleteSecondary(range: NSRange) {
@@ -1735,26 +1932,48 @@ final class NotesViewModel: ObservableObject {
         }
         var body = secondaryDraftBody
         var spans = secondaryDraftLockedSpans
+        var dismissals = isSameNoteInBothPanes ? dismissedOccurrences : []
         for seg in segments.sorted(by: { $0.location > $1.location }) {
             let ns = body as NSString
             guard seg.location + seg.length <= ns.length else { continue }
             body = ns.replacingCharacters(in: seg, with: "")
             spans = LockedSpanMath.adjusting(spans, edited: seg, replacementLength: 0)
+            if isSameNoteInBothPanes {
+                dismissals = adjustDismissed(dismissals, edited: seg, replacementLength: 0, in: body)
+            }
         }
         secondaryDraftBody = body
         secondaryDraftLockedSpans = LockedSpanMath.clamp(spans, toTextLength: (body as NSString).length)
+        if isSameNoteInBothPanes {
+            dismissedOccurrences = dismissals
+        }
         let caret = min(range.location, (body as NSString).length)
         secondarySelectedRange = NSRange(location: caret, length: 0)
         markSecondaryDirty()
         mirrorSecondaryDraftToPrimaryIfShared(fields: .body)
+        if isSameNoteInBothPanes {
+            scheduleSpellCheck(autoPopup: false)
+        }
+        saveStatus = "Deleted unlocked text"
     }
 
     func restoreSecondarySnapshot(text: String, spans: [LockedSpan], selection: NSRange) {
+        let previous = secondaryDraftBody
         secondaryDraftBody = text
         secondaryDraftLockedSpans = spans
         secondarySelectedRange = selection
+        if isSameNoteInBothPanes {
+            dismissedOccurrences = reconcileDismissedOnTextChange(
+                dismissedOccurrences,
+                from: previous,
+                to: text
+            )
+        }
         markSecondaryDirty()
         mirrorSecondaryDraftToPrimaryIfShared(fields: .body)
+        if isSameNoteInBothPanes {
+            scheduleSpellCheck(autoPopup: false)
+        }
     }
 
     private func markSecondaryDirty() {
@@ -1958,6 +2177,8 @@ final class NotesViewModel: ObservableObject {
             activeSuggestion = nil
             return
         }
+        // Drop dismissals whose text no longer sits at the recorded range.
+        dismissedOccurrences = pruneDismissed(dismissedOccurrences, in: text)
         // Large markdown: near-caret only keeps UI responsive after import/open.
         let utf16Len = (text as NSString).length
         let nearOnly = utf16Len > Self.fullSpellCheckUTF16Limit
@@ -1966,15 +2187,19 @@ final class NotesViewModel: ObservableObject {
             caretUTF16: selectedRange.location,
             nearCaretOnly: nearOnly
         )
-        // Ignore issues inside locked spans (templates shouldn't nag).
+        // Ignore issues inside locked spans (templates shouldn't nag) and
+        // previously dismissed occurrences still present on this page.
         misspellings = result.misspellings.filter { miss in
             !LockedSpanMath.anyBlocks(draftLockedSpans, edit: miss.utf16Range)
+                && !isDismissed(miss)
         }
 
         guard autoPopup else {
             if let active = activeSuggestion {
-                if let still = misspellings.first(where: {
-                    $0.utf16Range == active.utf16Range || $0.word == active.word
+                if isDismissed(active) {
+                    activeSuggestion = nil
+                } else if let still = misspellings.first(where: {
+                    $0.utf16Range == active.utf16Range && $0.word == active.word
                 }) {
                     activeSuggestion = fillSuggestions(still)
                 } else {
@@ -2002,6 +2227,108 @@ final class NotesViewModel: ObservableObject {
             }
         } else {
             activeSuggestion = nil
+        }
+    }
+
+    private func recordDismissed(_ misspelling: Misspelling) {
+        let entry = DismissedMisspelling(misspelling)
+        if !dismissedOccurrences.contains(where: { $0.matches(misspelling) }) {
+            dismissedOccurrences.append(entry)
+        }
+    }
+
+    private func isDismissed(_ misspelling: Misspelling) -> Bool {
+        dismissedOccurrences.contains { $0.matches(misspelling) }
+    }
+
+    /// When the body changes without an explicit edit range (binding / undo / paste fallback),
+    /// infer a single contiguous UTF-16 edit and shift dismissals like `commitEditorChange`.
+    private func reconcileDismissedOnTextChange(
+        _ items: [DismissedMisspelling],
+        from previous: String,
+        to newText: String
+    ) -> [DismissedMisspelling] {
+        guard !items.isEmpty else { return items }
+        guard !previous.isEmpty else {
+            return pruneDismissed(items, in: newText)
+        }
+        if let edit = Self.inferSingleEdit(from: previous, to: newText) {
+            return adjustDismissed(
+                items,
+                edited: edit.edited,
+                replacementLength: edit.replacementLength,
+                in: newText
+            )
+        }
+        return pruneDismissed(items, in: newText)
+    }
+
+    /// Infer a single contiguous UTF-16 edit between two strings (common prefix + common suffix).
+    private static func inferSingleEdit(
+        from old: String,
+        to new: String
+    ) -> (edited: NSRange, replacementLength: Int)? {
+        let oldNS = old as NSString
+        let newNS = new as NSString
+        let oldLen = oldNS.length
+        let newLen = newNS.length
+        if oldLen == 0, newLen == 0 { return nil }
+
+        var prefix = 0
+        let minLen = min(oldLen, newLen)
+        while prefix < minLen, oldNS.character(at: prefix) == newNS.character(at: prefix) {
+            prefix += 1
+        }
+
+        var oldEnd = oldLen
+        var newEnd = newLen
+        while oldEnd > prefix, newEnd > prefix,
+              oldNS.character(at: oldEnd - 1) == newNS.character(at: newEnd - 1) {
+            oldEnd -= 1
+            newEnd -= 1
+        }
+
+        return (
+            edited: NSRange(location: prefix, length: oldEnd - prefix),
+            replacementLength: newEnd - prefix
+        )
+    }
+
+    /// Shift or drop dismissed occurrences after a text edit (same rules as lock adjusting).
+    private func adjustDismissed(
+        _ items: [DismissedMisspelling],
+        edited: NSRange,
+        replacementLength: Int,
+        in text: String
+    ) -> [DismissedMisspelling] {
+        let delta = replacementLength - edited.length
+        let editEnd = edited.location + edited.length
+        var result: [DismissedMisspelling] = []
+        for item in items {
+            let spanEnd = item.location + item.length
+            if editEnd <= item.location {
+                // Edit entirely before this occurrence — shift.
+                result.append(DismissedMisspelling(
+                    location: item.location + delta,
+                    length: item.length,
+                    word: item.word
+                ))
+            } else if edited.location >= spanEnd {
+                // Edit entirely after — keep.
+                result.append(item)
+            }
+            // Overlap / replace of the dismissed instance: drop so a retyped word can re-flag.
+        }
+        return pruneDismissed(result, in: text)
+    }
+
+    private func pruneDismissed(_ items: [DismissedMisspelling], in text: String) -> [DismissedMisspelling] {
+        let ns = text as NSString
+        return items.filter { item in
+            guard item.length > 0,
+                  item.location >= 0,
+                  item.location + item.length <= ns.length else { return false }
+            return ns.substring(with: item.utf16Range) == item.word
         }
     }
 

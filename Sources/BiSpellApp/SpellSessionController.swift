@@ -35,7 +35,9 @@ final class SpellSessionController: ObservableObject {
     private var lastMisspellings: [Misspelling] = []
     private var lastBundleID: String = ""
     private var supportLog: [AppSupportSample] = []
-    private var suppressedPopupID: String?
+    /// Dismissed occurrences in the current focused field session (word + UTF-16 range).
+    /// Survives re-scans for the same instance; dropped when the text at that range changes.
+    private var dismissedOccurrences: [(word: String, location: Int, length: Int)] = []
 
     private var lastProbeWrite = Date.distantPast
     private var supportDirty = false
@@ -75,7 +77,7 @@ final class SpellSessionController: ObservableObject {
                 self.recheckNow()
             },
             onDismiss: { [weak self] misspelling in
-                self?.suppressedPopupID = misspelling.id
+                self?.recordDismissed(misspelling)
             }
         )
 
@@ -165,8 +167,6 @@ final class SpellSessionController: ObservableObject {
                 return
             }
         }
-
-        suppressedPopupID = nil
 
         if let snap = AXTextAccess.snapshot(
             deniedBundleIDs: settings.deniedBundleIDs,
@@ -509,7 +509,13 @@ final class SpellSessionController: ObservableObject {
         noFocusedField = false
         lastAXEventAt = Date()
 
+        // New app / empty field: dismissals are session-local to the focused document.
+        if lastBundleID != snap.bundleID {
+            dismissedOccurrences = []
+        }
         lastBundleID = snap.bundleID
+        let previousText = lastText
+        let previousOffset = lastTextOffset
         lastTextOffset = snap.textUTF16Offset
         setIfChanged(
             \.lastSnapshotSummary,
@@ -526,6 +532,7 @@ final class SpellSessionController: ObservableObject {
             lastMisspellings = []
             lastText = ""
             lastCharCount = snap.characterCount ?? 0
+            dismissedOccurrences = []
             return
         }
 
@@ -538,6 +545,29 @@ final class SpellSessionController: ObservableObject {
         }
 
         if textChanged || forceFull {
+            // Shift/drop dismissals for the inferred edit before pruning, so typing before a
+            // dismissed word keeps that same instance dismissed (not only exact-range prune).
+            // Ranges are snapshot-local (engine + recordDismissed + caret); keep that frame
+            // while the window offset is stable, and rebase/drop when it slides.
+            if textChanged {
+                dismissedOccurrences = reconcileDismissed(
+                    dismissedOccurrences,
+                    previousText: previousText,
+                    previousOffset: previousOffset,
+                    newText: snap.text,
+                    newOffset: snap.textUTF16Offset,
+                    previousCaret: lastCaret,
+                    newCaret: snap.caretUTF16
+                )
+            } else if previousOffset != snap.textUTF16Offset {
+                let delta = previousOffset - snap.textUTF16Offset
+                let rebased = dismissedOccurrences.map {
+                    ($0.word, $0.location + delta, $0.length)
+                }
+                dismissedOccurrences = pruneDismissed(rebased, in: snap.text)
+            } else {
+                dismissedOccurrences = pruneDismissed(dismissedOccurrences, in: snap.text)
+            }
             lastText = snap.text
             // Windowed snapshots already bound the document; only further-narrow full reads.
             let fullLen = snap.characterCount ?? ((snap.text as NSString).length + snap.textUTF16Offset)
@@ -548,14 +578,10 @@ final class SpellSessionController: ObservableObject {
                 bundleID: snap.bundleID,
                 nearCaretOnly: largeFullRead
             )
-            lastMisspellings = result.misspellings
-            setIfChanged(\.misspellingCount, result.misspellings.count)
-            overlay.showMarkers(misspellings: result.misspellings, utf16Offset: snap.textUTF16Offset)
-
-            if let suppressed = suppressedPopupID,
-               !result.misspellings.contains(where: { $0.id == suppressed }) {
-                suppressedPopupID = nil
-            }
+            let visible = result.misspellings.filter { !isDismissed($0) }
+            lastMisspellings = visible
+            setIfChanged(\.misspellingCount, visible.count)
+            overlay.showMarkers(misspellings: visible, utf16Offset: snap.textUTF16Offset)
         } else if caretChanged {
             // Positions may have scrolled; cheap reposition without re-check
             overlay.showMarkers(misspellings: lastMisspellings, utf16Offset: snap.textUTF16Offset)
@@ -581,7 +607,8 @@ final class SpellSessionController: ObservableObject {
             }
         }
 
-        if target.id == suppressedPopupID {
+        if isDismissed(target) {
+            overlay.hidePopup()
             return
         }
 
@@ -594,6 +621,177 @@ final class SpellSessionController: ObservableObject {
         overlay.showOrUpdateAutoPopup(for: filled, utf16Offset: lastTextOffset)
     }
 
+    private func recordDismissed(_ misspelling: Misspelling) {
+        let entry = (
+            word: misspelling.word,
+            location: misspelling.utf16Range.location,
+            length: misspelling.utf16Range.length
+        )
+        if !dismissedOccurrences.contains(where: {
+            $0.word == entry.word && $0.location == entry.location && $0.length == entry.length
+        }) {
+            dismissedOccurrences.append(entry)
+        }
+        // Drop from live list + markers so click/nearest cannot re-show this instance
+        // until the next full recheck (which also filters via isDismissed).
+        lastMisspellings.removeAll {
+            $0.word == entry.word
+                && $0.utf16Range.location == entry.location
+                && $0.utf16Range.length == entry.length
+        }
+        setIfChanged(\.misspellingCount, lastMisspellings.count)
+        overlay.hidePopup()
+        overlay.showMarkers(misspellings: lastMisspellings, utf16Offset: lastTextOffset)
+    }
+
+    private func isDismissed(_ misspelling: Misspelling) -> Bool {
+        dismissedOccurrences.contains {
+            $0.word == misspelling.word
+                && $0.location == misspelling.utf16Range.location
+                && $0.length == misspelling.utf16Range.length
+        }
+    }
+
+    /// After a text change, shift/drop dismissed ranges then prune by verifying substrings.
+    /// Dismiss locations, misspelling ranges, and caret are **snapshot-local** (relative to the
+    /// AX window text, not the full field). While `previousOffset == newOffset`, edits stay in
+    /// that local frame. When the window slides, locations are rebased by the offset delta (or
+    /// dropped if they fall outside the new snapshot after prune).
+    private func reconcileDismissed(
+        _ items: [(word: String, location: Int, length: Int)],
+        previousText: String,
+        previousOffset: Int,
+        newText: String,
+        newOffset: Int,
+        previousCaret: Int?,
+        newCaret: Int?
+    ) -> [(word: String, location: Int, length: Int)] {
+        guard !items.isEmpty else { return items }
+
+        // Window slid: snapshots are different slices of the field — do not infer edits across
+        // unrelated windows. Rebase snapshot-local → absolute → new-local, then prune.
+        if previousOffset != newOffset {
+            let rebase = previousOffset - newOffset
+            let rebased = items.map { ($0.word, $0.location + rebase, $0.length) }
+            return pruneDismissed(rebased, in: newText)
+        }
+
+        guard !previousText.isEmpty else {
+            return pruneDismissed(items, in: newText)
+        }
+
+        if let edit = Self.inferSingleEdit(from: previousText, to: newText) {
+            // Snapshot-local edit — do not add field offset.
+            return adjustDismissed(
+                items,
+                edited: edit.edited,
+                replacementLength: edit.replacementLength,
+                in: newText
+            )
+        }
+
+        // Inference unavailable: try caret-anchored pure insert/delete (caret is snapshot-local).
+        let prevLen = (previousText as NSString).length
+        let newLen = (newText as NSString).length
+        let lengthDelta = newLen - prevLen
+        if lengthDelta != 0, let caret = previousCaret ?? newCaret {
+            let deletedLen = max(0, -lengthDelta)
+            let insertedLen = max(0, lengthDelta)
+            // Prefer end-of-edit caret when available (after insert, caret is often at edit end).
+            let editStart: Int
+            if let newCaret, lengthDelta > 0 {
+                editStart = max(0, newCaret - lengthDelta)
+            } else if let previousCaret {
+                editStart = max(0, previousCaret - (lengthDelta < 0 ? deletedLen : 0))
+            } else {
+                editStart = max(0, caret - (lengthDelta < 0 ? deletedLen : 0))
+            }
+            return adjustDismissed(
+                items,
+                edited: NSRange(location: editStart, length: deletedLen),
+                replacementLength: insertedLen,
+                in: newText
+            )
+        }
+
+        return pruneDismissed(items, in: newText)
+    }
+
+    /// Infer a single contiguous UTF-16 edit between two strings (common prefix + common suffix).
+    private static func inferSingleEdit(
+        from old: String,
+        to new: String
+    ) -> (edited: NSRange, replacementLength: Int)? {
+        let oldNS = old as NSString
+        let newNS = new as NSString
+        let oldLen = oldNS.length
+        let newLen = newNS.length
+        if oldLen == 0, newLen == 0 { return nil }
+
+        var prefix = 0
+        let minLen = min(oldLen, newLen)
+        while prefix < minLen, oldNS.character(at: prefix) == newNS.character(at: prefix) {
+            prefix += 1
+        }
+
+        var oldEnd = oldLen
+        var newEnd = newLen
+        while oldEnd > prefix, newEnd > prefix,
+              oldNS.character(at: oldEnd - 1) == newNS.character(at: newEnd - 1) {
+            oldEnd -= 1
+            newEnd -= 1
+        }
+
+        return (
+            edited: NSRange(location: prefix, length: oldEnd - prefix),
+            replacementLength: newEnd - prefix
+        )
+    }
+
+    /// Shift or drop dismissed occurrences after a text edit (same rules as notes `adjustDismissed`).
+    /// `edited` and item locations are in the same coordinate frame (snapshot-local).
+    private func adjustDismissed(
+        _ items: [(word: String, location: Int, length: Int)],
+        edited: NSRange,
+        replacementLength: Int,
+        in text: String
+    ) -> [(word: String, location: Int, length: Int)] {
+        let delta = replacementLength - edited.length
+        let editEnd = edited.location + edited.length
+        var result: [(word: String, location: Int, length: Int)] = []
+        for item in items {
+            let spanEnd = item.location + item.length
+            if editEnd <= item.location {
+                // Edit entirely before this occurrence — shift.
+                result.append((item.word, item.location + delta, item.length))
+            } else if edited.location >= spanEnd {
+                // Edit entirely after — keep.
+                result.append(item)
+            }
+            // Overlap / replace of the dismissed instance: drop so a retyped word can re-flag.
+        }
+        return pruneDismissed(result, in: text)
+    }
+
+    /// Keep only dismissals whose word still sits at the recorded **snapshot-local** UTF-16 range.
+    private func pruneDismissed(
+        _ items: [(word: String, location: Int, length: Int)],
+        in text: String
+    ) -> [(word: String, location: Int, length: Int)] {
+        let ns = text as NSString
+        let localLen = ns.length
+        return items.filter { item in
+            guard item.length > 0,
+                  item.location >= 0,
+                  item.location + item.length <= localLen else {
+                // Outside current snapshot window — drop (cannot validate).
+                return false
+            }
+            let slice = ns.substring(with: NSRange(location: item.location, length: item.length))
+            return slice == item.word
+        }
+    }
+
     private func apply(misspelling: Misspelling, replacement: String) {
         let ok = AXTextAccess.replaceUTF16Range(
             in: lastText,
@@ -603,9 +801,9 @@ final class SpellSessionController: ObservableObject {
             useClipboardFallback: settings.useClipboardFallback
         )
         if ok {
+            shiftDismissalsAfterApply(misspelling: misspelling, replacement: replacement)
             lastText = ""
             lastCharCount = -1
-            suppressedPopupID = nil
             recheckNow(forceFull: true)
         } else {
             let retry = AXTextAccess.replaceUTF16Range(
@@ -616,13 +814,34 @@ final class SpellSessionController: ObservableObject {
                 useClipboardFallback: true
             )
             if retry {
+                shiftDismissalsAfterApply(misspelling: misspelling, replacement: replacement)
                 lastText = ""
                 lastCharCount = -1
-                suppressedPopupID = nil
                 recheckNow(forceFull: true)
             } else {
                 lastSnapshotSummary = "Replace failed in this app"
             }
+        }
+    }
+
+    /// Drop the applied occurrence and shift later dismissals by the replacement length delta.
+    private func shiftDismissalsAfterApply(misspelling: Misspelling, replacement: String) {
+        let edit = misspelling.utf16Range
+        let replLen = (replacement as NSString).length
+        let delta = replLen - edit.length
+        let editEnd = edit.location + edit.length
+        dismissedOccurrences = dismissedOccurrences.compactMap { item in
+            if item.location == edit.location, item.length == edit.length, item.word == misspelling.word {
+                return nil
+            }
+            let spanEnd = item.location + item.length
+            if editEnd <= item.location {
+                return (item.word, item.location + delta, item.length)
+            }
+            if edit.location >= spanEnd {
+                return item
+            }
+            return nil
         }
     }
 

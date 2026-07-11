@@ -16,7 +16,7 @@ struct NotesRootView: View {
     @State private var pendingNewAsTemplate = false
     @State private var pendingTemplateID: UUID?
     @State private var showDirtyFromTemplateAlert = false
-    @State private var showLockLabelSheet = false
+
     @State private var exportJSONData: Data?
     @State private var showExportJSON = false
     @State private var exportMarkdownFiles: [(String, String)] = []
@@ -112,7 +112,7 @@ struct NotesRootView: View {
                 pendingTemplateID = nil
             }
         } message: {
-            Text("Save the current note before creating one from a template?")
+            Text("Save the current note before applying a template?")
         }
         .sheet(item: $viewModel.pendingVariableForm) { form in
             TemplateVariablesSheet(
@@ -123,12 +123,6 @@ struct NotesRootView: View {
                 },
                 onCancel: { viewModel.cancelVariableForm() }
             )
-            .environment(\.notesTokens, tokens)
-        }
-        .sheet(isPresented: $showLockLabelSheet) {
-            LockLabelSheet { label in
-                viewModel.lockSelection(label: label)
-            }
             .environment(\.notesTokens, tokens)
         }
         .sheet(isPresented: $viewModel.showQuickSwitcher) {
@@ -564,7 +558,7 @@ struct NotesRootView: View {
     @ViewBuilder
     private func noteContextMenu(_ note: Note, isTemplate: Bool) -> some View {
         if isTemplate {
-            Button("New Note from Template") {
+            Button("Apply Template") {
                 attemptNewFromTemplate(note.id)
             }
             Button("Move to Notes") {
@@ -707,7 +701,7 @@ struct NotesRootView: View {
                         viewModel.applySuggestion(suggestion, for: miss)
                     },
                     onDismissSuggestions: {
-                        viewModel.secondaryActiveSuggestion = nil
+                        viewModel.dismissSecondarySuggestions()
                     },
                     canEdit: { range, rep in
                         viewModel.canEditSecondary(range: range, replacement: rep)
@@ -809,7 +803,7 @@ struct NotesRootView: View {
                     onNewTemplate: attemptNewTemplate,
                     onFromTemplate: attemptNewFromTemplate,
                     onDelete: { confirmDelete = true },
-                    onLock: { showLockLabelSheet = true },
+                    onLock: { viewModel.lockSelection() },
                     onExportJSON: exportJSON,
                     onExportMarkdown: exportMarkdown,
                     onImport: openImportPanel,

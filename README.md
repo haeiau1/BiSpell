@@ -86,7 +86,7 @@ Each entry is `{ wrong, correct, count, firstCorrectedAt, lastCorrectedAt }`. Co
 - **Unlock**: selection or caret inside a locked span.
 - Sidebar **Templates** section is separate from **Notes**.
 - **New → New Template**, or **Move to Templates** on a note.
-- **New Note from Template** (context menu / menu) copies body + locked spans into a new editable note.
+- **Apply Template** (Create / context menu): with a regular note open, fills `{{vars}}` then **appends** body + locked spans (offset) to the current draft. Creates a **new** note only when nothing suitable is selected or the open document is itself a template.
 
 ## Notes appearance (terminal UI)
 
